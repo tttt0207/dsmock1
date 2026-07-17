@@ -106,7 +106,8 @@ function Should-SkipPath {
 		"logs",
 		"dataset",
 		"datasets",
-		"deploy_config.ps1"
+		"deploy_config.ps1",
+		"增加球定点判断版本.py"
 	)
 
 	if ($excludedNames -contains $Item.Name) {
@@ -118,6 +119,7 @@ function Should-SkipPath {
 		$excludedExtensions = @(
 			".pyc",
 			".pyo",
+			".pid",
 			".log",
 			".tmp",
 			".jpg",
