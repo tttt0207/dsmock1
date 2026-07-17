@@ -109,6 +109,22 @@ Restart:
 .\deploy.ps1 -Restart
 ```
 
+Check Orange Pi status without changing remote files:
+
+```powershell
+.\status.ps1
+```
+
+The status script reads `deploy_config.ps1`, connects by SSH, and shows these read-only sections:
+
+- SSH connection
+- System status
+- Vision program status from `vision.pid`
+- Camera status without opening the camera
+- Latest log file and last 20 lines
+
+It does not stop, restart, delete, install, or create files on Orange Pi. It does not use `pkill`, `killall`, or `kill`.
+
 View logs on Orange Pi:
 
 ```bash

@@ -67,6 +67,34 @@ function Shell-Quote {
 	return "'" + ($Value -replace "'", "'\''") + "'"
 }
 
+function Quote-WindowsArgument {
+	param([string]$Value)
+
+	if ($Value -notmatch '[\s"]') {
+		return $Value
+	}
+
+	return '"' + ($Value -replace '\\', '\\' -replace '"', '\"') + '"'
+}
+
+function Quote-BashArgument {
+	param([string]$Value)
+	return "'" + ($Value -replace "'", "'\''") + "'"
+}
+
+function Get-SshArgumentText {
+	param([string]$RemoteCommand)
+
+	$target = "$($script:SshUser)@$($script:OrangePiIp)"
+	$args = @(
+		"-p", "$($script:SshPort)",
+		$target,
+		$RemoteCommand
+	)
+
+	return ($args | ForEach-Object { Quote-WindowsArgument $_ }) -join " "
+}
+
 function Invoke-Remote {
 	param(
 		[string]$Command,
@@ -77,6 +105,58 @@ function Invoke-Remote {
 	& ssh -p $script:SshPort $target $Command
 
 	if ($LASTEXITCODE -ne 0) {
+		throw $FailureMessage
+	}
+}
+
+function Invoke-RemoteBash {
+	param(
+		[string]$BashScript,
+		[string[]]$Arguments = @(),
+		[string]$FailureMessage
+	)
+
+	$remoteCommand = "bash -s"
+
+	if ($Arguments.Count -gt 0) {
+		$remoteCommand += " --"
+		foreach ($arg in $Arguments) {
+			$remoteCommand += " " + (Quote-BashArgument $arg)
+		}
+	}
+
+	$normalizedScript = ($BashScript -replace "`r`n", "`n" -replace "`r", "`n")
+	if (-not $normalizedScript.EndsWith("`n")) {
+		$normalizedScript += "`n"
+	}
+
+	$psi = [System.Diagnostics.ProcessStartInfo]::new()
+	$psi.FileName = "ssh"
+	$psi.Arguments = Get-SshArgumentText -RemoteCommand $remoteCommand
+	$psi.RedirectStandardInput = $true
+	$psi.RedirectStandardOutput = $true
+	$psi.RedirectStandardError = $true
+	$psi.UseShellExecute = $false
+	$psi.CreateNoWindow = $true
+
+	$process = [System.Diagnostics.Process]::Start($psi)
+	$process.StandardInput.NewLine = "`n"
+	$process.StandardInput.Write($normalizedScript)
+	$process.StandardInput.Close()
+
+	$stdout = $process.StandardOutput.ReadToEnd()
+	$stderr = $process.StandardError.ReadToEnd()
+	$process.WaitForExit()
+
+	if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+		Write-Host $stdout.TrimEnd()
+	}
+
+	if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+		Write-Host $stderr.TrimEnd()
+	}
+
+	if ($process.ExitCode -ne 0) {
 		throw $FailureMessage
 	}
 }
@@ -196,82 +276,112 @@ function Sync-Project {
 }
 
 function Stop-RemoteProgram {
-	$remoteDir = Shell-Quote $script:RemoteProjectDir
-	$pidFile = Shell-Quote $PidFileName
+	$bashScript = @'
+PROJECT_DIR="$1"
+PID_FILE="$PROJECT_DIR/vision.pid"
 
-	$command = @"
-cd $remoteDir 2>/dev/null || { echo 'Remote project directory does not exist. Nothing to stop.'; exit 0; }
-if [ ! -f $pidFile ]; then echo 'No vision.pid found. Nothing to stop.'; exit 0; fi
-pid=`$(cat $pidFile)
-case "`$pid" in
-	''|*[!0-9]*) echo 'vision.pid does not contain a valid PID. Refusing to stop.'; exit 1 ;;
-esac
-if ! kill -0 "`$pid" 2>/dev/null; then
-	echo 'Recorded PID is not running. Removing stale vision.pid.'
-	rm -f $pidFile
+if [ ! -f "$PID_FILE" ]; then
+	echo "Program is not running, or PID file does not exist."
 	exit 0
 fi
-cwd=`$(readlink "/proc/`$pid/cwd" 2>/dev/null || true)
-cmd=`$(tr '\0' ' ' < "/proc/`$pid/cmdline" 2>/dev/null || true)
-expected=`$(pwd -P)
-if [ "`$cwd" != "`$expected" ]; then
-	echo "PID `$pid is not running from this project directory. Refusing to stop."
-	exit 1
+
+pid=$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null || true)
+
+if [ -z "$pid" ]; then
+	echo "Warning: vision.pid is empty. Nothing was stopped."
+	exit 0
 fi
-case "`$cmd" in
-	*main.py*) ;;
-	*) echo "PID `$pid is not this project's main.py process. Refusing to stop."; exit 1 ;;
+
+case "$pid" in
+	*[!0-9]*)
+		echo "Warning: vision.pid is not numeric. Nothing was stopped."
+		exit 0
+		;;
 esac
-kill "`$pid"
+
+if [ ! -d "/proc/$pid" ]; then
+	echo "PID file is stale; process does not exist."
+	exit 0
+fi
+
+cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+
+case "$cmd" in
+	*main.py*|*"$PROJECT_DIR"*) ;;
+	*)
+		echo "Safety warning: PID $pid does not look like this project. Refusing to stop."
+		echo "Command line: $cmd"
+		exit 1
+		;;
+esac
+
+echo "Stopping project process PID=$pid"
+kill "$pid"
+
 for i in 1 2 3 4 5 6 7 8 9 10; do
-	if ! kill -0 "`$pid" 2>/dev/null; then
-		rm -f $pidFile
-		echo "Stopped PID `$pid."
+	if [ ! -d "/proc/$pid" ]; then
+		rm -f "$PID_FILE"
+		echo "Stopped PID $pid."
 		exit 0
 	fi
-	sleep 1
+	sleep 0.5
 done
-echo "Stop signal was sent, but PID `$pid is still running. Please check Orange Pi manually."
-exit 1
-"@
 
-	Invoke-Remote $command "Failed to stop remote program."
+echo "Stop signal was sent, but PID $pid is still running. Please check Orange Pi manually."
+exit 1
+'@
+
+	Invoke-RemoteBash -BashScript $bashScript -Arguments @($script:RemoteProjectDir) -FailureMessage "Failed to stop remote program."
 }
 
 function Start-RemoteProgram {
-	$remoteDir = Shell-Quote $script:RemoteProjectDir
-	$pidFile = Shell-Quote $PidFileName
+	$bashScript = @'
+PROJECT_DIR="$1"
+PID_FILE="$PROJECT_DIR/vision.pid"
 
-	$command = @"
-cd $remoteDir || { echo 'Remote project directory does not exist.'; exit 1; }
-if [ ! -f main.py ]; then echo 'main.py is missing. Cannot start.'; exit 1; fi
-if [ ! -f run.sh ]; then echo 'run.sh is missing. Cannot start.'; exit 1; fi
+cd "$PROJECT_DIR" || { echo "Remote project directory does not exist."; exit 1; }
+
+if [ ! -f main.py ]; then
+	echo "main.py is missing. Cannot start."
+	exit 1
+fi
+
+if [ ! -f run.sh ]; then
+	echo "run.sh is missing. Cannot start."
+	exit 1
+fi
+
 chmod +x run.sh
 mkdir -p logs
-if [ -f $pidFile ]; then
-	oldpid=`$(cat $pidFile)
-	case "`$oldpid" in
+
+if [ -f "$PID_FILE" ]; then
+	oldpid=$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null || true)
+	case "$oldpid" in
 		''|*[!0-9]*) oldpid='' ;;
 	esac
-	if [ -n "`$oldpid" ] && kill -0 "`$oldpid" 2>/dev/null; then
-		echo "Program already seems to be running. PID=`$oldpid. Use -Restart to restart."
+
+	if [ -n "$oldpid" ] && [ -d "/proc/$oldpid" ]; then
+		echo "Program already seems to be running. PID=$oldpid. Use -Restart to restart."
 		exit 0
 	fi
 fi
-log_file="logs/vision_`$(date +%Y%m%d_%H%M%S).log"
-nohup ./run.sh >> "`$log_file" 2>&1 < /dev/null &
-pid=`$!
-echo "`$pid" > $pidFile
+
+log_file="logs/vision_$(date +%Y%m%d_%H%M%S).log"
+nohup ./run.sh >> "$log_file" 2>&1 < /dev/null &
+pid=$!
+echo "$pid" > "$PID_FILE"
 sleep 1
-if kill -0 "`$pid" 2>/dev/null; then
-	echo "Started vision program. PID=`$pid, log=`$log_file"
+
+if [ -d "/proc/$pid" ]; then
+	echo "Started vision program. PID=$pid, log=$log_file"
 	exit 0
 fi
-echo "Remote program failed to start. Check log: `$log_file"
-exit 1
-"@
 
-	Invoke-Remote $command "Remote run failed. Check logs under the Orange Pi project directory."
+echo "Remote program failed to start. Check log: $log_file"
+exit 1
+'@
+
+	Invoke-RemoteBash -BashScript $bashScript -Arguments @($script:RemoteProjectDir) -FailureMessage "Remote run failed. Check logs under the Orange Pi project directory."
 }
 
 try {
