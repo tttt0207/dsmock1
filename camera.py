@@ -40,7 +40,7 @@ def open_camera() -> cv2.VideoCapture:
 
 	actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
 	actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-	print(f"Camera opened: id={config.CAMERA_ID}, size={actual_width}x{actual_height}")
+	print(f"[CAMERA] opened id={config.CAMERA_ID} size={actual_width}x{actual_height}")
 
 	return camera
 

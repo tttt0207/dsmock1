@@ -5,6 +5,9 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+import config
+import roi_utils
+
 
 # ============================================================
 # 只需要优先修改这里
@@ -15,14 +18,19 @@ CAMERA_ID = 1
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 
-# 黑框实际尺寸
-FRAME_WIDTH_CM = 20.0
-FRAME_HEIGHT_CM = 10.0
-BLACK_BORDER_CM = 1.4
+# 完整货物放置区实际尺寸，现场可按实物微调。
+FRAME_WIDTH_CM = config.FRAME_WIDTH_CM
+FRAME_HEIGHT_CM = config.FRAME_HEIGHT_CM
+BLACK_BORDER_CM = config.BLACK_BORDER_CM
+FRAME_EXPECTED_RATIO = config.FRAME_EXPECTED_RATIO
 
-# 透视矫正后的尺寸
-FRAME_WARP_WIDTH = 800
-FRAME_WARP_HEIGHT = 400
+# 完整 40 cm x 15 cm 场地透视尺寸，约 30 px/cm。
+FRAME_WARP_WIDTH = config.FRAME_WARP_WIDTH
+FRAME_WARP_HEIGHT = config.FRAME_WARP_HEIGHT
+
+# 左右 A/B 子区域透视尺寸，单区约 20 cm x 15 cm。
+REGION_WARP_WIDTH = config.REGION_WARP_WIDTH
+REGION_WARP_HEIGHT = config.REGION_WARP_HEIGHT
 
 # 黑色阈值：反光较强时可将 BLACK_V_MAX 从 95 调到 110~125
 BLACK_H_MIN = 0
@@ -33,15 +41,15 @@ BLACK_S_MAX = 255
 BLACK_V_MAX = 105
 
 # 黑框候选限制
-FRAME_RATIO_MIN = 1.45
-FRAME_RATIO_MAX = 2.65
+FRAME_RATIO_MIN = config.FRAME_RATIO_MIN
+FRAME_RATIO_MAX = config.FRAME_RATIO_MAX
 FRAME_MIN_AREA_RATIO = 0.025
 FRAME_MAX_AREA_RATIO = 0.55
 FRAME_MIN_SCORE = 0.38
 MAX_FRAME_JUMP_PX = 90.0
 REACQUIRE_MIN_SCORE = 0.62
 REACQUIRE_MAX_BORDER_ERROR_CM = 0.45
-REACQUIRE_RATIO_ERROR = 0.35
+REACQUIRE_RATIO_ERROR = 0.65
 FRAME_REACQUIRE_CONFIRMATIONS = 3
 FRAME_PENDING_MATCH_PX = 45.0
 FRAME_SMOOTH_ALPHA = 0.20
@@ -118,6 +126,14 @@ class FrameCandidate:
 	ring_score: float
 	area_ratio: float
 	center: tuple[float, float]
+	rectangularity: float = 0.0
+	border_score: float = 0.0
+	roi_offset: tuple[int, int] = (0, 0)
+	divider_found: bool = False
+	divider_score: float = 0.0
+	divider_x: int = -1
+	vertical_coverage: float = 0.0
+	divider_width_px: int = 0
 
 
 @dataclass
@@ -204,6 +220,26 @@ def create_black_mask(frame: np.ndarray) -> np.ndarray:
 	return mask
 
 
+def get_placement_search_roi(
+	frame: np.ndarray,
+) -> tuple[np.ndarray, int, int, int, int]:
+	height, width = frame.shape[:2]
+	x0, y0, x1, y1 = roi_utils.get_placement_roi_bounds(width, height)
+
+	return frame[y0:y1, x0:x1], x0, y0, x1, y1
+
+
+def offset_box_to_global(
+	box: np.ndarray,
+	roi_x0: int,
+	roi_y0: int,
+) -> np.ndarray:
+	global_box = np.asarray(box, dtype=np.float32).copy()
+	global_box[:, 0] += float(roi_x0)
+	global_box[:, 1] += float(roi_y0)
+	return global_box
+
+
 def warp_binary_to_candidate(
 	mask: np.ndarray,
 	box: np.ndarray,
@@ -233,6 +269,44 @@ def warp_binary_to_candidate(
 
 
 def make_ideal_ring(width: int, height: int, thickness: int) -> np.ndarray:
+	ring = np.zeros((height, width), dtype=np.uint8)
+
+	cv2.rectangle(
+		ring,
+		(0, 0),
+		(width - 1, height - 1),
+		255,
+		-1,
+	)
+
+	inner_left = thickness
+	inner_top = thickness
+	inner_right = width - 1 - thickness
+	inner_bottom = height - 1 - thickness
+
+	if inner_right > inner_left and inner_bottom > inner_top:
+		cv2.rectangle(
+			ring,
+			(inner_left, inner_top),
+			(inner_right, inner_bottom),
+			0,
+			-1,
+		)
+
+	center_x = width // 2
+	half_thickness = max(1, thickness // 2)
+	cv2.rectangle(
+		ring,
+		(center_x - half_thickness, 0),
+		(center_x + half_thickness, height - 1),
+		255,
+		-1,
+	)
+
+	return ring
+
+
+def make_ideal_inner_region_ring(width: int, height: int, thickness: int) -> np.ndarray:
 	ring = np.zeros((height, width), dtype=np.uint8)
 
 	cv2.rectangle(
@@ -287,12 +361,9 @@ def estimate_border_width(
 	warped_mask: np.ndarray,
 ) -> tuple[float, float]:
 	"""
-	把候选框统一拉伸到 400×200。
+	把候选框统一拉伸到完整 40×15 场地比例。
 
-	由于真实外框为 20×10 cm，因此两个方向都是 20 px/cm。
-	1.4 cm 理论上约等于 28 px。
-
-	遍历不同厚度的理想矩形环，选择与实际黑色掩膜最接近的厚度。
+	遍历不同厚度的“外框 + 中央分隔线”模板，选择与实际黑色掩膜最接近的厚度。
 	"""
 	height, width = warped_mask.shape[:2]
 
@@ -319,6 +390,148 @@ def estimate_border_width(
 
 	border_cm = best_thickness / pixels_per_cm if pixels_per_cm > 0 else 0.0
 	return border_cm, best_score
+
+
+def estimate_inner_region_border_width(
+	warped_mask: np.ndarray,
+) -> tuple[float, float]:
+	height, width = warped_mask.shape[:2]
+	pixels_per_cm_x = width / config.INNER_REGION_WIDTH_CM
+	pixels_per_cm_y = height / config.INNER_REGION_HEIGHT_CM
+	pixels_per_cm = (pixels_per_cm_x + pixels_per_cm_y) / 2.0
+
+	min_thickness = max(4, int(0.45 * pixels_per_cm))
+	max_thickness = min(
+		int(min(width, height) * 0.26),
+		int(2.9 * pixels_per_cm),
+	)
+	best_thickness = 0
+	best_score = 0.0
+
+	for thickness in range(min_thickness, max_thickness + 1):
+		ideal_ring = make_ideal_inner_region_ring(width, height, thickness)
+		score = mask_f1_score(warped_mask, ideal_ring)
+
+		if score > best_score:
+			best_score = score
+			best_thickness = thickness
+
+	border_cm = best_thickness / pixels_per_cm if pixels_per_cm > 0 else 0.0
+	return border_cm, best_score
+
+
+@dataclass
+class DividerAnalysis:
+	found: bool
+	score: float
+	x: int
+	vertical_coverage: float
+	width_px: int
+	segment_coverage: tuple[float, float, float]
+
+
+def _best_contiguous_runs(values: np.ndarray) -> list[tuple[int, int]]:
+	runs = []
+	start = None
+
+	for index, value in enumerate(values):
+		if value and start is None:
+			start = index
+		elif not value and start is not None:
+			runs.append((start, index))
+			start = None
+
+	if start is not None:
+		runs.append((start, len(values)))
+
+	return runs
+
+
+def analyze_middle_divider(warped_mask: np.ndarray) -> DividerAnalysis:
+	height, width = warped_mask.shape[:2]
+	fallback_x = width // 2
+
+	if height <= 0 or width <= 0:
+		return DividerAnalysis(False, 0.0, fallback_x, 0.0, 0, (0.0, 0.0, 0.0))
+
+	search_left = int(width * config.DIVIDER_SEARCH_MIN_RATIO)
+	search_right = int(width * config.DIVIDER_SEARCH_MAX_RATIO)
+	search_left = max(0, min(width - 1, search_left))
+	search_right = max(search_left + 1, min(width, search_right))
+
+	inner_top = int(height * config.DIVIDER_INNER_TOP_RATIO)
+	inner_bottom = int(height * config.DIVIDER_INNER_BOTTOM_RATIO)
+	inner_top = max(0, min(height - 1, inner_top))
+	inner_bottom = max(inner_top + 1, min(height, inner_bottom))
+
+	search_mask = warped_mask[
+		inner_top:inner_bottom,
+		search_left:search_right,
+	] > 0
+	inner_height = search_mask.shape[0]
+
+	if inner_height <= 0 or search_mask.shape[1] <= 0:
+		return DividerAnalysis(False, 0.0, fallback_x, 0.0, 0, (0.0, 0.0, 0.0))
+
+	column_ratios = np.count_nonzero(search_mask, axis=0) / max(1, inner_height)
+	strong_columns = column_ratios >= config.DIVIDER_MIN_BLACK_RATIO
+	runs = _best_contiguous_runs(strong_columns)
+
+	best = DividerAnalysis(False, 0.0, fallback_x, 0.0, 0, (0.0, 0.0, 0.0))
+
+	for run_start, run_end in runs:
+		width_px = run_end - run_start
+
+		if width_px <= 0:
+			continue
+
+		run_mask = search_mask[:, run_start:run_end]
+		row_has_black = np.any(run_mask, axis=1)
+		vertical_coverage = float(np.count_nonzero(row_has_black) / max(1, inner_height))
+		segments = np.array_split(row_has_black, 3)
+		segment_coverage = tuple(
+			float(np.count_nonzero(segment) / max(1, len(segment)))
+			for segment in segments
+		)
+		min_segment = min(segment_coverage) if segment_coverage else 0.0
+
+		width_score = 1.0
+		if width_px < config.DIVIDER_MIN_WIDTH_PX:
+			width_score = width_px / max(1, config.DIVIDER_MIN_WIDTH_PX)
+		elif width_px > config.DIVIDER_MAX_WIDTH_PX:
+			width_score = max(
+				0.0,
+				1.0 - (
+					(width_px - config.DIVIDER_MAX_WIDTH_PX)
+					/ max(1, config.DIVIDER_MAX_WIDTH_PX)
+				),
+			)
+
+		score = (
+			0.48 * vertical_coverage
+			+ 0.34 * min_segment
+			+ 0.18 * width_score
+		)
+		x = search_left + int((run_start + run_end - 1) / 2)
+		found = (
+			width_px >= config.DIVIDER_MIN_WIDTH_PX
+			and width_px <= config.DIVIDER_MAX_WIDTH_PX
+			and vertical_coverage >= config.DIVIDER_VERTICAL_MIN_RATIO
+			and min_segment >= config.DIVIDER_SEGMENT_MIN_RATIO
+			and score >= config.DIVIDER_SCORE_MIN
+		)
+
+		if score > best.score:
+			best = DividerAnalysis(
+				found=found,
+				score=score,
+				x=x,
+				vertical_coverage=vertical_coverage,
+				width_px=width_px,
+				segment_coverage=segment_coverage,
+			)
+
+	return best
 
 
 def candidate_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
@@ -354,7 +567,25 @@ def remove_duplicate_frame_candidates(
 		duplicate = False
 
 		for accepted in result:
-			if candidate_iou(candidate.box, accepted.box) > 0.72:
+			iou = candidate_iou(candidate.box, accepted.box)
+			center_distance = math.hypot(
+				candidate.center[0] - accepted.center[0],
+				candidate.center[1] - accepted.center[1],
+			)
+			size_diff = abs(candidate.area_ratio - accepted.area_ratio) / max(
+				candidate.area_ratio,
+				accepted.area_ratio,
+				1e-6,
+			)
+
+			if iou > config.BLACK_FRAME_NMS_IOU_THRESHOLD:
+				duplicate = True
+				break
+
+			if (
+				center_distance < config.BLACK_FRAME_MIN_CENTER_DISTANCE_PX
+				and size_diff <= config.BLACK_FRAME_MAX_SIZE_RATIO_DIFF
+			):
 				duplicate = True
 				break
 
@@ -368,21 +599,25 @@ def find_black_frame_candidates(
 	frame: np.ndarray,
 	last_frame_points: np.ndarray | None = None,
 ) -> tuple[list[FrameCandidate], np.ndarray]:
-	black_mask = create_black_mask(frame)
+	roi, roi_x0, roi_y0, roi_x1, roi_y1 = get_placement_search_roi(frame)
+	roi_black_mask = create_black_mask(roi)
+	black_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+	black_mask[roi_y0:roi_y1, roi_x0:roi_x1] = roi_black_mask
 
+	# 使用 RETR_TREE 保留外框、中线及共享边界产生的层级轮廓，避免只剩外部复杂轮廓。
 	contours, _ = cv2.findContours(
-		black_mask,
-		cv2.RETR_LIST,
+		roi_black_mask,
+		cv2.RETR_TREE,
 		cv2.CHAIN_APPROX_SIMPLE,
 	)
 
-	frame_area = frame.shape[0] * frame.shape[1]
+	roi_area = roi_black_mask.shape[0] * roi_black_mask.shape[1]
 	candidates = []
 
 	for contour in contours:
 		contour_area = cv2.contourArea(contour)
 
-		if contour_area < frame_area * 0.008:
+		if contour_area < roi_area * 0.004:
 			continue
 
 		rect = cv2.minAreaRect(contour)
@@ -395,27 +630,36 @@ def find_black_frame_candidates(
 		short_side = min(width, height)
 		ratio = long_side / short_side
 
-		if not FRAME_RATIO_MIN <= ratio <= FRAME_RATIO_MAX:
+		if not config.INNER_REGION_RATIO_MIN <= ratio <= config.INNER_REGION_RATIO_MAX:
 			continue
 
-		box = order_points(cv2.boxPoints(rect))
-		box_area = abs(cv2.contourArea(box))
-		area_ratio = box_area / frame_area
+		local_box = order_points(cv2.boxPoints(rect))
+		box_area = abs(cv2.contourArea(local_box))
+		area_ratio = box_area / max(1, roi_area)
+		rectangularity = contour_area / box_area if box_area > 0 else 0.0
 
-		if not FRAME_MIN_AREA_RATIO <= area_ratio <= FRAME_MAX_AREA_RATIO:
+		if not config.INNER_REGION_MIN_AREA_RATIO <= area_ratio <= config.INNER_REGION_MAX_AREA_RATIO:
 			continue
 
-		warped_mask = warp_binary_to_candidate(black_mask, box)
-		border_cm, ring_score = estimate_border_width(warped_mask)
+		if rectangularity < config.INNER_REGION_MIN_RECTANGULARITY:
+			continue
+
+		warped_mask = warp_binary_to_candidate(
+			roi_black_mask,
+			local_box,
+			REGION_WARP_WIDTH,
+			REGION_WARP_HEIGHT,
+		)
+		border_cm, ring_score = estimate_inner_region_border_width(warped_mask)
 		border_error_cm = abs(border_cm - BLACK_BORDER_CM)
 
-		# 长宽比越接近 2 越好。
+		# 长宽比越接近单个 17x13 小内框比例越好。
 		ratio_score = max(
 			0.0,
-			1.0 - abs(ratio - 2.0) / 0.75,
+			1.0 - abs(ratio - config.INNER_REGION_EXPECTED_RATIO) / 0.35,
 		)
 
-		# 黑边宽度越接近 1.4 cm 越好。
+		# 黑边宽度越接近场地 2 cm 黑线越好。
 		border_score = math.exp(
 			-((border_error_cm / 0.48) ** 2)
 		)
@@ -429,22 +673,28 @@ def find_black_frame_candidates(
 		# 综合分只评价候选本身，不把“靠近上一帧”写入候选排名。
 		# 否则一旦第一帧选错，错误框会因位置优势一直锁死。
 		score = (
-			0.30 * ratio_score
-			+ 0.36 * border_score
-			+ 0.29 * ring_score
+			0.32 * ratio_score
+			+ 0.28 * border_score
+			+ 0.20 * ring_score
+			+ 0.15 * min(1.0, rectangularity)
 			+ 0.05 * size_score
 		)
+		global_box = offset_box_to_global(local_box, roi_x0, roi_y0)
+		global_center = (center_x + roi_x0, center_y + roi_y0)
 
 		candidates.append(
 			FrameCandidate(
-				box=box,
+				box=global_box,
 				score=score,
 				border_cm=border_cm,
 				border_error_cm=border_error_cm,
 				ratio=ratio,
 				ring_score=ring_score,
 				area_ratio=area_ratio,
-				center=(center_x, center_y),
+				center=global_center,
+				rectangularity=rectangularity,
+				border_score=border_score,
+				roi_offset=(roi_x0, roi_y0),
 			)
 		)
 
@@ -470,7 +720,7 @@ class FrameTracker:
 			candidate.score >= REACQUIRE_MIN_SCORE
 			and candidate.border_error_cm
 			<= REACQUIRE_MAX_BORDER_ERROR_CM
-			and abs(candidate.ratio - 2.0)
+			and abs(candidate.ratio - config.INNER_REGION_EXPECTED_RATIO)
 			<= REACQUIRE_RATIO_ERROR
 		)
 
@@ -550,6 +800,14 @@ class FrameTracker:
 				ring_score=best.ring_score,
 				area_ratio=best.area_ratio,
 				center=polygon_center(self.points),
+				rectangularity=best.rectangularity,
+				border_score=best.border_score,
+				roi_offset=best.roi_offset,
+				divider_found=best.divider_found,
+				divider_score=best.divider_score,
+				divider_x=best.divider_x,
+				vertical_coverage=best.vertical_coverage,
+				divider_width_px=best.divider_width_px,
 			)
 
 			self.pending_candidate = None
@@ -593,65 +851,172 @@ def draw_frame_candidates(
 	candidates: list[FrameCandidate],
 	selected_box: np.ndarray | None,
 ) -> None:
-	if not SHOW_FRAME_CANDIDATES:
+	if not (
+		config.DEBUG_DRAW_SELECTED_REGIONS
+		or config.DEBUG_DRAW_SELECTED_LABELS
+		or (
+			config.DEBUG_DRAW_ENABLED
+			and (
+				config.DEBUG_DRAW_ROI
+				or config.DEBUG_DRAW_ALL_CANDIDATES
+				or config.DEBUG_DRAW_ALL_PAIRS
+				or config.DEBUG_DRAW_PAIR_TEXT
+			)
+		)
+	):
 		return
 
-	for index, candidate in enumerate(
-		candidates[:MAX_CANDIDATES_TO_DRAW],
-		start=1,
-	):
-		box_int = candidate.box.astype(np.int32)
+	_, roi_x0, roi_y0, roi_x1, roi_y1 = get_placement_search_roi(image)
 
-		is_selected = False
-
-		if selected_box is not None:
-			is_selected = (
-				average_corner_distance(
-					candidate.box,
-					selected_box,
-				)
-				< 8.0
-			)
-
-		line_thickness = 3 if is_selected else 1
-
-		cv2.polylines(
+	if config.DEBUG_DRAW_ENABLED and config.DEBUG_DRAW_ROI:
+		cv2.rectangle(
 			image,
-			[box_int],
-			True,
-			(255, 255, 255),
-			line_thickness,
+			(roi_x0, roi_y0),
+			(roi_x1 - 1, roi_y1 - 1),
+			(0, 255, 255),
+			1,
 		)
-
-		text_x = int(candidate.center[0])
-		text_y = int(candidate.center[1])
-
-		label = (
-			f"#{index} "
-			f"S={candidate.score:.2f} "
-			f"B={candidate.border_cm:.2f}cm "
-			f"R={candidate.ratio:.2f}"
+		roi_label = (
+			f"ROI x={config.PLACEMENT_ROI_X_MIN_RATIO:.2f}-"
+			f"{config.PLACEMENT_ROI_X_MAX_RATIO:.2f} "
+			f"y={config.PLACEMENT_ROI_Y_MIN_RATIO:.2f}-"
+			f"{config.PLACEMENT_ROI_Y_MAX_RATIO:.2f}"
 		)
-
 		cv2.putText(
 			image,
-			label,
-			(max(text_x - 150, 5), max(text_y, 20)),
+			roi_label,
+			(roi_x0 + 6, max(20, roi_y0 + 20)),
 			cv2.FONT_HERSHEY_SIMPLEX,
 			0.48,
-			(255, 255, 255),
+			(0, 255, 255),
 			1,
 			cv2.LINE_AA,
 		)
 
+	if not (
+		config.DEBUG_DRAW_SELECTED_REGIONS
+		or config.DEBUG_DRAW_SELECTED_LABELS
+		or (
+			config.DEBUG_DRAW_ENABLED
+			and (
+				config.DEBUG_DRAW_ALL_PAIRS
+				or config.DEBUG_DRAW_PAIR_TEXT
+			)
+		)
+	):
+		return
 
-def warp_frame(frame: np.ndarray, frame_points: np.ndarray) -> np.ndarray:
+	try:
+		import target_selector
+	except ImportError:
+		return
+
+	pair_evaluations = target_selector.evaluate_candidate_pairs(candidates)
+	selected_evaluation = next(
+		(
+			item
+			for item in pair_evaluations
+			if item.accepted
+		),
+		None,
+	)
+
+	for pair_index, evaluation in enumerate(
+		pair_evaluations[:getattr(config, "MAX_PAIRS_TO_DRAW", 12)],
+		start=1,
+	):
+		left_center = evaluation.left_candidate.center
+		right_center = evaluation.right_candidate.center
+		is_selected = evaluation is selected_evaluation
+		accepted = evaluation.accepted
+		color = (0, 255, 0) if is_selected else (255, 180, 0) if accepted else (80, 80, 255)
+		thickness = 3 if is_selected else 1
+
+		if config.DEBUG_DRAW_ENABLED and config.DEBUG_DRAW_ALL_PAIRS:
+			cv2.line(
+				image,
+				(int(left_center[0]), int(left_center[1])),
+				(int(right_center[0]), int(right_center[1])),
+				color,
+				thickness,
+				cv2.LINE_AA,
+			)
+
+		if not (config.DEBUG_DRAW_ENABLED and config.DEBUG_DRAW_PAIR_TEXT):
+			continue
+
+		label_x = int((left_center[0] + right_center[0]) / 2.0)
+		label_y = int((left_center[1] + right_center[1]) / 2.0) + 22 + pair_index * 14
+		pair_label = (
+			f"pair=({evaluation.left_index},{evaluation.right_index}) "
+			f"ps={evaluation.pair_score:.2f} "
+			f"as={evaluation.area_similarity:.2f} "
+			f"ws={evaluation.width_similarity:.2f} "
+			f"hs={evaluation.height_similarity:.2f} "
+			f"ys={evaluation.center_y_similarity:.2f} "
+			f"gap={evaluation.gap_ratio:.2f} "
+			f"ds={evaluation.divider_score:.2f} "
+			f"{'accepted' if accepted else evaluation.reject_reason}"
+		)
+
+		if is_selected:
+			pair_label = "SELECTED PAIR " + pair_label
+
+		cv2.putText(
+			image,
+			pair_label,
+			(max(label_x - 230, 5), max(label_y, 20)),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			0.42,
+			color,
+			1,
+			cv2.LINE_AA,
+		)
+
+	if selected_evaluation is not None:
+		for area_name, candidate in (
+			("A", selected_evaluation.left_candidate),
+			("B", selected_evaluation.right_candidate),
+		):
+			box_int = candidate.box.astype(np.int32)
+
+			if config.DEBUG_DRAW_SELECTED_REGIONS:
+				cv2.polylines(
+					image,
+					[box_int],
+					True,
+					(0, 255, 0),
+					3,
+				)
+
+			if config.DEBUG_DRAW_SELECTED_LABELS:
+				cv2.putText(
+					image,
+					area_name,
+					(int(candidate.center[0]) - 12, int(candidate.center[1]) + 28),
+					cv2.FONT_HERSHEY_SIMPLEX,
+					1.0,
+					(0, 255, 0),
+					2,
+					cv2.LINE_AA,
+				)
+
+
+def warp_frame(
+	frame: np.ndarray,
+	frame_points: np.ndarray,
+	output_width: int | None = None,
+	output_height: int | None = None,
+) -> np.ndarray:
+	width = output_width if output_width is not None else FRAME_WARP_WIDTH
+	height = output_height if output_height is not None else FRAME_WARP_HEIGHT
+
 	target_points = np.array(
 		[
 			[0, 0],
-			[FRAME_WARP_WIDTH - 1, 0],
-			[FRAME_WARP_WIDTH - 1, FRAME_WARP_HEIGHT - 1],
-			[0, FRAME_WARP_HEIGHT - 1],
+			[width - 1, 0],
+			[width - 1, height - 1],
+			[0, height - 1],
 		],
 		dtype=np.float32,
 	)
@@ -664,7 +1029,7 @@ def warp_frame(frame: np.ndarray, frame_points: np.ndarray) -> np.ndarray:
 	return cv2.warpPerspective(
 		frame,
 		matrix,
-		(FRAME_WARP_WIDTH, FRAME_WARP_HEIGHT),
+		(width, height),
 	)
 
 
@@ -1259,19 +1624,6 @@ def main() -> None:
 			frame_tracker.points,
 		)
 
-		if frame_tracker.points is not None:
-			cv2.polylines(
-				display_source,
-				[
-					frame_tracker.points.astype(
-						np.int32
-					)
-				],
-				True,
-				(255, 255, 255),
-				3,
-			)
-
 		if use_warp and frame_tracker.points is not None:
 			working_image = warp_frame(
 				frame,
@@ -1322,41 +1674,25 @@ def main() -> None:
 			cv2.LINE_AA,
 		)
 
-		if frame_tracker.candidate is not None:
-			frame_text = (
-				f"Frame score="
-				f"{frame_tracker.candidate.score:.2f} "
-				f"border="
-				f"{frame_tracker.candidate.border_cm:.2f}cm"
+		if config.SHOW_SOURCE_CANDIDATES_WINDOW:
+			cv2.imshow(
+				"source_candidates",
+				display_source,
 			)
 
-			cv2.putText(
+		if config.SHOW_RESULT_WINDOW:
+			cv2.imshow(
+				"result",
 				result,
-				frame_text,
-				(10, 84),
-				cv2.FONT_HERSHEY_SIMPLEX,
-				0.58,
-				(255, 255, 255),
-				2,
-				cv2.LINE_AA,
 			)
 
-		cv2.imshow(
-			"source_candidates",
-			display_source,
-		)
-		cv2.imshow(
-			"result",
-			result,
-		)
-
-		if show_masks:
+		if config.SHOW_COLOR_MASK_WINDOWS and show_masks:
 			cv2.imshow(
 				"color_masks",
 				create_mask_preview(masks),
 			)
 
-		if show_black_mask:
+		if config.SHOW_BLACK_MASK_WINDOW and show_black_mask:
 			if black_mask is None:
 				black_mask = create_black_mask(frame)
 

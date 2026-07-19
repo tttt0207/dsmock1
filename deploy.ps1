@@ -116,7 +116,19 @@ function Invoke-RemoteBash {
 		[string]$FailureMessage
 	)
 
-	$remoteCommand = "bash -s"
+	# Encode the remote script locally and decode it on Orange Pi. This avoids
+	# BOM or terminal encoding artifacts being interpreted as bash commands.
+	$normalizedScript = ($BashScript -replace "`r`n", "`n" -replace "`r", "`n")
+	$normalizedScript = $normalizedScript.TrimStart([char]0xFEFF)
+
+	if (-not $normalizedScript.EndsWith("`n")) {
+		$normalizedScript += "`n"
+	}
+
+	$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+	$scriptBytes = $utf8NoBom.GetBytes($normalizedScript)
+	$scriptBase64 = [System.Convert]::ToBase64String($scriptBytes)
+	$remoteCommand = "printf %s " + (Quote-BashArgument $scriptBase64) + " | base64 -d | bash -s"
 
 	if ($Arguments.Count -gt 0) {
 		$remoteCommand += " --"
@@ -125,25 +137,16 @@ function Invoke-RemoteBash {
 		}
 	}
 
-	$normalizedScript = ($BashScript -replace "`r`n", "`n" -replace "`r", "`n")
-	if (-not $normalizedScript.EndsWith("`n")) {
-		$normalizedScript += "`n"
-	}
-
 	$psi = [System.Diagnostics.ProcessStartInfo]::new()
 	$psi.FileName = "ssh"
 	$psi.Arguments = Get-SshArgumentText -RemoteCommand $remoteCommand
-	$psi.RedirectStandardInput = $true
+	$psi.RedirectStandardInput = $false
 	$psi.RedirectStandardOutput = $true
 	$psi.RedirectStandardError = $true
 	$psi.UseShellExecute = $false
 	$psi.CreateNoWindow = $true
 
 	$process = [System.Diagnostics.Process]::Start($psi)
-	$process.StandardInput.NewLine = "`n"
-	$process.StandardInput.Write($normalizedScript)
-	$process.StandardInput.Close()
-
 	$stdout = $process.StandardOutput.ReadToEnd()
 	$stderr = $process.StandardError.ReadToEnd()
 	$process.WaitForExit()
@@ -186,8 +189,7 @@ function Should-SkipPath {
 		"logs",
 		"dataset",
 		"datasets",
-		"deploy_config.ps1",
-		"增加球定点判断版本.py"
+		"deploy_config.ps1"
 	)
 
 	if ($excludedNames -contains $Item.Name) {
@@ -196,6 +198,15 @@ function Should-SkipPath {
 
 	if (-not $Item.PSIsContainer) {
 		$extension = $Item.Extension.ToLowerInvariant()
+
+		if ($extension -eq ".py") {
+			foreach ($char in $Item.Name.ToCharArray()) {
+				if ([int][char]$char -gt 127) {
+					return $true
+				}
+			}
+		}
+
 		$excludedExtensions = @(
 			".pyc",
 			".pyo",
@@ -243,6 +254,16 @@ function Copy-FilteredProject {
 		}
 		else {
 			Copy-Item -LiteralPath $item.FullName -Destination $targetPath -Force
+
+			# Normalize Linux shell scripts to UTF-8 without BOM and LF.
+			if ($item.Extension.ToLowerInvariant() -eq ".sh") {
+				$text = [System.IO.File]::ReadAllText($targetPath)
+				$text = $text.TrimStart([char]0xFEFF)
+				$text = $text -replace "`r`n", "`n" -replace "`r", "`n"
+
+				$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+				[System.IO.File]::WriteAllText($targetPath, $text, $utf8NoBom)
+			}
 		}
 	}
 }
@@ -301,6 +322,7 @@ esac
 
 if [ ! -d "/proc/$pid" ]; then
 	echo "PID file is stale; process does not exist."
+	rm -f "$PID_FILE"
 	exit 0
 fi
 
@@ -339,7 +361,7 @@ function Start-RemoteProgram {
 PROJECT_DIR="$1"
 PID_FILE="$PROJECT_DIR/vision.pid"
 
-cd "$PROJECT_DIR" || { echo "Remote project directory does not exist."; exit 1; }
+cd "$PROJECT_DIR" || { echo "Remote project directory does not exist: $PROJECT_DIR"; exit 1; }
 
 if [ ! -f main.py ]; then
 	echo "main.py is missing. Cannot start."
@@ -364,6 +386,8 @@ if [ -f "$PID_FILE" ]; then
 		echo "Program already seems to be running. PID=$oldpid. Use -Restart to restart."
 		exit 0
 	fi
+
+	rm -f "$PID_FILE"
 fi
 
 log_file="logs/vision_$(date +%Y%m%d_%H%M%S).log"

@@ -3,7 +3,8 @@ from dataclasses import dataclass
 import cv2
 
 import config
-import detector
+
+_OPEN_WINDOWS: set[str] = set()
 
 
 @dataclass
@@ -32,21 +33,56 @@ def show_images(
 	black_mask,
 	state: DisplayState,
 ) -> None:
-	cv2.imshow(config.WINDOW_SOURCE, source_image)
-	cv2.imshow(config.WINDOW_RESULT, result_image)
+	show_window(
+		config.WINDOW_SOURCE,
+		source_image,
+		config.SHOW_SOURCE_CANDIDATES_WINDOW,
+	)
+	show_window(
+		config.WINDOW_RESULT,
+		result_image,
+		config.SHOW_RESULT_WINDOW,
+	)
 
-	if state.show_masks:
+	show_window(
+		config.WINDOW_COLOR_MASKS,
+		create_color_mask_preview(masks) if masks else None,
+		config.SHOW_COLOR_MASK_WINDOWS and state.show_masks,
+	)
+	show_window(
+		config.WINDOW_BLACK_MASK,
+		black_mask,
+		config.SHOW_BLACK_MASK_WINDOW and state.show_black_mask,
+	)
+
+
+def show_window(
+	name: str,
+	image,
+	visible: bool,
+) -> None:
+	if visible:
+		if image is None:
+			return
+
 		cv2.imshow(
-			config.WINDOW_COLOR_MASKS,
-			detector.create_mask_preview(masks),
+			name,
+			image,
 		)
+		_OPEN_WINDOWS.add(name)
+		return
 
-	if state.show_black_mask and black_mask is not None:
-		cv2.imshow(config.WINDOW_BLACK_MASK, black_mask)
+	close_window_if_hidden(name, False)
 
 
 def read_key(delay_ms: int = 1) -> int:
 	return cv2.waitKey(delay_ms) & 0xFF
+
+
+def create_color_mask_preview(masks):
+	import detector
+
+	return detector.create_mask_preview(masks)
 
 
 def handle_key(key: int, state: DisplayState) -> DisplayState:
@@ -72,7 +108,7 @@ def handle_key(key: int, state: DisplayState) -> DisplayState:
 		state.show_masks = not state.show_masks
 
 		if not state.show_masks:
-			close_window(config.WINDOW_COLOR_MASKS)
+			close_window_if_hidden(config.WINDOW_COLOR_MASKS, False)
 
 		return state
 
@@ -80,16 +116,36 @@ def handle_key(key: int, state: DisplayState) -> DisplayState:
 		state.show_black_mask = not state.show_black_mask
 
 		if not state.show_black_mask:
-			close_window(config.WINDOW_BLACK_MASK)
+			close_window_if_hidden(config.WINDOW_BLACK_MASK, False)
 
 		return state
 
 	if key == ord("f"):
-		visible = detector.toggle_show_frame_candidates()
-		print(f"Frame candidates: {'on' if visible else 'off'}")
+		config.DEBUG_DRAW_ENABLED = not config.DEBUG_DRAW_ENABLED
+		config.DEBUG_DRAW_ALL_CANDIDATES = config.DEBUG_DRAW_ENABLED
+		config.DEBUG_DRAW_CANDIDATE_TEXT = config.DEBUG_DRAW_ENABLED
+		config.DEBUG_DRAW_ALL_PAIRS = config.DEBUG_DRAW_ENABLED
+		config.DEBUG_DRAW_PAIR_TEXT = config.DEBUG_DRAW_ENABLED
+		config.DEBUG_DRAW_ROI = config.DEBUG_DRAW_ENABLED
+		config.SHOW_SOURCE_CANDIDATES_WINDOW = config.DEBUG_DRAW_ENABLED
+		print(f"Frame debug: {'on' if config.DEBUG_DRAW_ENABLED else 'off'}")
 		return state
 
 	return state
+
+
+def close_window_if_hidden(
+	name: str,
+	visible: bool,
+) -> None:
+	if visible:
+		return
+
+	if name not in _OPEN_WINDOWS:
+		return
+
+	close_window(name)
+	_OPEN_WINDOWS.discard(name)
 
 
 def close_window(name: str) -> None:
@@ -101,3 +157,4 @@ def close_window(name: str) -> None:
 
 def close_all_windows() -> None:
 	cv2.destroyAllWindows()
+	_OPEN_WINDOWS.clear()
